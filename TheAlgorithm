@@ -1,0 +1,201 @@
+#Sharing Quantopian algorithms is severely limited. If this code is copy pasted
+#into an empty Quantopian algorithm, it will run as intended.
+#The algorithm consistently yields a high Sharpe ratio (over 1), whilst
+#of course remaining market neutral
+
+import quantopian.algorithm as algo
+import quantopian.optimize as opt
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.factors import ExponentialWeightedMovingAverage
+
+from quantopian.pipeline.filters import QTradableStocksUS
+from quantopian.pipeline.experimental import risk_loading_pipeline
+
+from quantopian.pipeline.data.psychsignal import stocktwits
+from quantopian.pipeline.data import Fundamentals
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import CustomFactor
+from quantopian.pipeline.data import morningstar
+
+# Constraint Parameters
+MAX_GROSS_LEVERAGE = 1.0
+TOTAL_POSITIONS = 600
+
+# This ensures we diversify our longs and our shorts, by making it so no single stock or small
+# subset of stocks takes up our positions
+MAX_SHORT_POSITION_SIZE = 1.0 / TOTAL_POSITIONS
+MAX_LONG_POSITION_SIZE = 1.0 / TOTAL_POSITIONS
+
+# These are examples of factor creation via classes
+class MarketCap(CustomFactor):
+    
+    inputs = [USEquityPricing.close, morningstar.valuation.shares_outstanding]
+    window_length = 1
+    
+    def compute(self, today, assets, out, close, shares):
+        out[:] = shares[-1] * close[-1]
+
+class MomentumFactor(CustomFactor):
+    
+    inputs = [USEquityPricing.close]
+    window_length = 100
+    
+    def compute(self, today, assets, out, close):
+        out[:] = (close[-1] - close[0])/close[-1]
+        
+class BookMarketValue(CustomFactor):
+    
+    inputs = [morningstar.balance_sheet.common_stock_equity.latest, morningstar.valuation.shares_outstanding, USEquityPricing.close]
+    window_length = 1
+    
+    def compute(self, today, assets, out, close, shares, equity):
+        out[:] = equity[-1]/(shares[-1] * close[-1])
+
+# This is called at the start of the algorithm
+def initialize(context):
+
+    algo.attach_pipeline(make_pipeline(), 'long_short_equity_template')
+
+    # Attach the pipeline for the risk model factors that we
+    # want to neutralize in the optimization step. The 'risk_factors' string is
+    # used to retrieve the output of the pipeline in before_trading_start below.
+    algo.attach_pipeline(risk_loading_pipeline(), 'risk_factors')
+
+    # Schedule rebalance function
+    algo.schedule_function(func=rebalance,
+                           date_rule=algo.date_rules.week_start(),
+                           time_rule=algo.time_rules.market_open(hours=0, minutes=30),
+                           half_days=True)
+
+    # Record portfolio variables at the end of day
+    algo.schedule_function(func=record_vars,
+                           date_rule=algo.date_rules.every_day(),
+                           time_rule=algo.time_rules.market_close(),
+                           half_days=True)
+
+
+# This is our pipeline, our main data frame with our portfolio (which is constantly changing),
+# and with our combined factor
+def make_pipeline():
+    
+    base_universe = QTradableStocksUS()
+
+    # The reasoning behind vfactor1 and 2 is that a low pe ratio can signify either that the stock
+    # is undervalued or that it is a risky investment. So if we find companies with a low pe but also
+    # a high return on equity, it is like to be undervalued, as the company is still yielding good
+    # returns
+    vfactor1 = Fundamentals.pe_ratio.latest
+    vfactor2 = Fundamentals.roe.latest
+    
+    vfactor1 = vfactor1.rank(mask=base_universe, method='average', ascending=False)
+    vfactor2 = vfactor2.rank(mask=base_universe, method='average', ascending=True)
+    
+    vfactor3 = BookMarketValue()
+    vfactor3 = vfactor3.rank(mask=base_universe, method='average', ascending=True)
+    
+    value_factor = vfactor1 + vfactor2 + vfactor3
+    
+    #Create our momentum factor
+    mean_12 = ExponentialWeightedMovingAverage(
+    inputs=[USEquityPricing.close],
+    window_length=12,
+    decay_rate=(1 - (2.0 / (1 + 15.0))))
+    
+    mean_26 = ExponentialWeightedMovingAverage(
+    inputs=[USEquityPricing.close],
+    window_length=26,
+    decay_rate=(1 - (2.0 / (1 + 15.0))))
+    
+    momentum_factor = (mean_12 - mean_26) / mean_26
+    
+    momentum_factor = momentum_factor.rank(mask=base_universe, method='average')
+    
+    # An alternative momentum factor
+    momentum_factor2 = MomentumFactor()
+    momentum_factor2 = momentum_factor2.rank()
+    
+    # Creating a market cap factor, as it is often reasoned smaller companies often tend to show more 
+    # growth
+    market_cap_factor = MarketCap()
+    market_cap_factor = market_cap_factor.rank(ascending=False)
+    
+    # At this stage can plug in any factors from above to backtest their performance as a combination
+    # Value factor by itself performed the best in backtests, although this is in no way rigorous
+    combined_factor = value_factor
+    
+    Russell2000 = (1000 < market_cap_factor) & (market_cap_factor <= 3000)
+    
+    # Now we just long the highest ranked stocks, and short the lowest ranked
+    longs = combined_factor.top(TOTAL_POSITIONS//2, mask=Russell2000)
+    shorts = combined_factor.bottom(TOTAL_POSITIONS//2, mask=Russell2000)
+
+    # The final output of our pipeline should only include
+    # the top/bottom 300 stocks by our criteria
+    long_short_screen = (longs | shorts)
+
+    # Create the pipeline (dataframe)
+    pipe = Pipeline(
+        columns={
+            'longs': longs,
+            'shorts': shorts,
+            'combined_factor': combined_factor
+        },
+        screen=long_short_screen
+    )
+    return pipe
+
+
+# This is called between trading hours
+def before_trading_start(context, data):
+
+    context.pipeline_data = algo.pipeline_output('long_short_equity_template')
+
+    # This dataframe will contain all of our risk loadings
+    context.risk_loadings = algo.pipeline_output('risk_factors')
+
+
+# This keeps track of our variables throughout the runtime of the algorithm
+def record_vars(context, data):
+
+    # Number of positions over time.
+    algo.record(num_positions=len(context.portfolio.positions))
+
+
+# This is called each month to rebalance our portfolio, allowing us to take risk measures by
+# enforcing constraints
+def rebalance(context, data):
+
+    # Retrieve pipeline output
+    pipeline_data = context.pipeline_data
+
+    risk_loadings = context.risk_loadings
+
+    objective = opt.MaximizeAlpha(pipeline_data.combined_factor)
+
+    # Define the list of constraints
+    constraints = []
+    # Constrain our maximum gross leverage
+    constraints.append(opt.MaxGrossExposure(MAX_GROSS_LEVERAGE))
+
+    # Require our algorithm to remain dollar neutral
+    constraints.append(opt.DollarNeutral())
+
+    # Add the RiskModelExposure constraint to make use of the
+    # default risk model constraints
+    neutralize_risk_factors = opt.experimental.RiskModelExposure(
+        risk_model_loadings=risk_loadings,
+        version=0
+    )
+    constraints.append(neutralize_risk_factors)
+
+    constraints.append(
+        opt.PositionConcentration.with_equal_bounds(
+            min=-MAX_SHORT_POSITION_SIZE,
+            max=MAX_LONG_POSITION_SIZE
+        ))
+
+    # We put all of this together
+    algo.order_optimal_portfolio(
+        objective=objective,
+        constraints=constraints
+    )
